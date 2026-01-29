@@ -4,6 +4,11 @@
 <head>
     <meta charset="UTF-8">
     <title>LiteWorship Projector</title>
+    <!-- Google Fonts: Montserrat (Modern, Clean, Readable) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;800&display=swap" rel="stylesheet">
+
     <style>
         body,
         html {
@@ -14,6 +19,7 @@
             background-color: #000;
             overflow: hidden;
             cursor: none;
+            /* Hide cursor on output */
         }
 
         /* Video Layer */
@@ -26,11 +32,11 @@
             object-fit: cover;
             z-index: 1;
             opacity: 0;
-            transition: opacity 1s;
+            transition: opacity 1.5s ease-in-out;
         }
 
-        /* Text Container - Safe Area */
-        #lyrics {
+        /* Container allowing centering */
+        #lyrics-container {
             position: absolute;
             top: 0;
             left: 0;
@@ -40,30 +46,53 @@
             align-items: center;
             justify-content: center;
             z-index: 10;
-            text-align: center;
-            padding: 4vw;
+            padding: 5vw;
             box-sizing: border-box;
         }
 
-        /* Text Element */
+        /* The actual text element */
         #text-content {
             color: white;
-            font-family: 'Arial', sans-serif;
-            font-weight: bold;
-            text-shadow: 2px 2px 15px black;
+            font-family: 'Montserrat', sans-serif;
+            font-weight: 800;
+            /* Extra Bold for visibility */
+            text-align: center;
+
+            /* Professional Shadow/Outline */
+            text-shadow:
+                0px 2px 10px rgba(0, 0, 0, 0.8),
+                0px 5px 20px rgba(0, 0, 0, 0.8);
+
             opacity: 0;
-            transition: opacity 0.3s;
+            transform: scale(0.98);
+            /* Slight zoom in effect */
+            transition: opacity 0.4s ease-out, transform 0.4s ease-out;
+
             width: 100%;
-            /* Start huge, let JS shrink it */
+            /* height: auto;  <-- Removed constraints to allow proper measuring */
+
+            display: flex;
+            align-items: center;
+            justify-content: center;
+
+            /* Default Large Size */
             font-size: 8vw;
             line-height: 1.2;
+            white-space: pre-wrap;
+            /* Preserve newlines */
+        }
+
+        .visible {
+            opacity: 1 !important;
+            transform: scale(1.0) !important;
         }
     </style>
 </head>
 
 <body>
     <video id="bg-video" loop muted playsinline></video>
-    <div id="lyrics">
+
+    <div id="lyrics-container">
         <div id="text-content"></div>
     </div>
 
@@ -71,42 +100,66 @@
         const ws = new WebSocket('ws://localhost:8080/ws');
         const textEl = document.getElementById('text-content');
         const videoEl = document.getElementById('bg-video');
+        const container = document.getElementById('lyrics-container');
 
-        // --- THE MAGIC AUTO-FIT FUNCTION ---
+        // Robust Fit Text function
         function fitText() {
-            let size = 8; // Start at 8vw (Large)
-            textEl.style.fontSize = size + 'vw';
+            // Reset to large size to start measuring
+            let fontSize = 10;
+            textEl.style.fontSize = fontSize + 'vw';
 
-            // Loop: Check if text is taller than screen. If so, shrink font.
-            // We verify textEl.scrollHeight vs window.innerHeight
-            while (textEl.scrollHeight > (window.innerHeight * 0.85) && size > 1.5) {
-                size -= 0.2;
-                textEl.style.fontSize = size + 'vw';
+            // Calculate available space (taking padding into account)
+            // 5vw padding on each side = 10vw total removed
+            const maxW = window.innerWidth * 0.9;
+            const maxH = window.innerHeight * 0.9;
+
+            // Shrink until fits
+            // We use clientHeight/Width of textEl now that max-height is gone
+            while ((textEl.clientWidth > maxW || textEl.clientHeight > maxH) && fontSize > 2) {
+                fontSize -= 0.5;
+                textEl.style.fontSize = fontSize + 'vw';
             }
         }
 
-        ws.onopen = () => console.log("Connected");
+        ws.onopen = () => console.log("Connected to LiteWorship Server");
+
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
+
             if (data.type === 'LYRICS') {
-                textEl.style.opacity = 0;
+                // Fade Out
+                textEl.classList.remove('visible');
+
                 setTimeout(() => {
                     textEl.innerText = data.content;
-                    // Reset font size to max before measuring
-                    textEl.style.fontSize = '8vw';
-                    fitText(); // Run calculation
-                    textEl.style.opacity = 1;
-                }, 300);
+
+                    // Reset and Recalculate Size
+                    textEl.style.fontSize = '10vw';
+                    fitText();
+
+                    // Fade In
+                    textEl.classList.add('visible');
+                }, 300); // Wait for fade out
             }
             else if (data.type === 'BACKGROUND') {
                 if (data.content === 'STOP') {
                     videoEl.style.opacity = 0;
+                    setTimeout(() => videoEl.pause(), 1500);
                 } else {
-                    videoEl.src = data.content; videoEl.play(); videoEl.style.opacity = 1;
+                    videoEl.src = data.content;
+                    videoEl.play();
+                    videoEl.style.opacity = 1;
                 }
             } else if (data.type === 'CLEAR') {
-                textEl.style.opacity = 0;
+                textEl.classList.remove('visible');
             }
+        };
+
+        // Auto-reconnect if server restarts
+        ws.onclose = function () {
+            setTimeout(function () {
+                window.location.reload();
+            }, 3000);
         };
     </script>
 </body>

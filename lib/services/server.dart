@@ -68,9 +68,12 @@ Future<void> startProjectorServer() async {
 
 // Global helper to send messages
 void sendProjectorMessage(Map<String, dynamic> data) {
+  debugPrint('sendProjectorMessage called with: $data');
   if (projectorSink != null) {
+      debugPrint('Sending to projector...');
       projectorSink.add(jsonEncode(data));
+      debugPrint('Sent successfully!');
   } else {
-    debugPrint('Cannot send message: Projector Disconnected');
+    debugPrint('Cannot send message: Projector Disconnected (projectorSink is null)');
   }
 }
