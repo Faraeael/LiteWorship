@@ -2,6 +2,9 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../data/database.dart';
 import '../repositories/song_repository.dart';
+import '../repositories/bible_repository.dart'; // import
+import '../providers/bible_provider.dart'; // import
+import '../models/search_result.dart'; // import
 
 // ============================================================================
 // LITEWORSHIP — Search Logic
@@ -75,17 +78,30 @@ final searchControllerProvider = Provider.autoDispose((ref) {
 // ----------------------------------------------------------------------------
 
 /// Async search results based on the debounced query
-final searchResultsProvider = FutureProvider.autoDispose<List<Song>>((ref) async {
+final searchResultsProvider = FutureProvider.autoDispose<List<SearchResultItem>>((ref) async {
   final query = ref.watch(debouncedQueryProvider);
-  final repo = ref.watch(songRepositoryProvider);
+  final songRepo = ref.watch(songRepositoryProvider);
+  final bibleRepo = ref.watch(bibleRepositoryProvider); // Implies bible_provider.dart is imported
 
   if (query.isEmpty) {
     // Return all songs (limited) if query is empty
-    // Or maybe just empty list? User asked: "If query is empty, show 'All Songs'."
-    // This implies fetching all songs.
-    return repo.getAll();
+    final songs = await songRepo.getAll();
+    return songs.map((s) => SongResult(s)).toList();
   }
 
-  // Perform search
-  return repo.search(query);
+  // Perform parallel search
+  final results = await Future.wait([
+    songRepo.search(query),
+    bibleRepo.searchByKeyword(query),
+  ]);
+  
+  final songs = results[0] as List<Song>;
+  final verses = results[1] as List<BibleVerse>;
+
+  // Combine
+  final List<SearchResultItem> combined = [];
+  combined.addAll(songs.map((s) => SongResult(s)));
+  combined.addAll(verses.map((v) => BibleResult(v)));
+  
+  return combined;
 });

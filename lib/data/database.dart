@@ -1,6 +1,11 @@
+
+import 'dart:io';
 import 'package:drift/drift.dart';
-import 'package:drift_flutter/drift_flutter.dart';
+import 'package:drift/native.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+import 'package:uuid/uuid.dart';
 import 'tables.dart';
 
 part 'database.g.dart';
@@ -23,19 +28,20 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
     return _instance!;
   }
 
-  /// Open database connection using drift_flutter
+  /// Open database connection directly (No Isolate)
   static QueryExecutor _openConnection() {
-    return driftDatabase(
-      name: 'lite_worship',
-      native: const DriftNativeOptions(
-        // Enable shared cache for better performance
-        shareAcrossIsolates: true,
-      ),
-    );
+    return LazyDatabase(() async {
+      final dbFolder = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dbFolder.path, 'lite_worship.sqlite'));
+      // Simplified Path Logging
+      print("DB PATH: ${dbFolder.path}");
+      debugPrint('📂 Database Path: ${file.path}');
+      return NativeDatabase(file);
+    });
   }
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   MigrationStrategy get migration {
@@ -53,7 +59,11 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
         debugPrint('✅ Database created with FTS5 tables');
       },
       onUpgrade: (Migrator m, int from, int to) async {
-        // Future migrations go here
+        if (from < 2) {
+          // Migration to v2: Add source and uuid columns
+          await m.addColumn(songs, songs.source);
+          await m.addColumn(songs, songs.uuid);
+        }
         debugPrint('📦 Migrating database from v$from to v$to');
       },
     );
@@ -101,7 +111,7 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
     await customStatement('''
       CREATE VIRTUAL TABLE IF NOT EXISTS bible_verses_fts USING fts5(
         book,
-        content_text,
+        content,
         content='bible_verses',
         content_rowid='id',
         tokenize='porter unicode61 remove_diacritics 2'
@@ -111,23 +121,23 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
     // Triggers for Bible FTS sync
     await customStatement('''
       CREATE TRIGGER IF NOT EXISTS bible_ai AFTER INSERT ON bible_verses BEGIN
-        INSERT INTO bible_verses_fts(rowid, book, content_text) 
+        INSERT INTO bible_verses_fts(rowid, book, content) 
         VALUES (new.id, new.book, new.content);
       END;
     ''');
 
     await customStatement('''
       CREATE TRIGGER IF NOT EXISTS bible_ad AFTER DELETE ON bible_verses BEGIN
-        INSERT INTO bible_verses_fts(bible_verses_fts, rowid, book, content_text) 
+        INSERT INTO bible_verses_fts(bible_verses_fts, rowid, book, content) 
         VALUES ('delete', old.id, old.book, old.content);
       END;
     ''');
 
     await customStatement('''
       CREATE TRIGGER IF NOT EXISTS bible_au AFTER UPDATE ON bible_verses BEGIN
-        INSERT INTO bible_verses_fts(bible_verses_fts, rowid, book, content_text) 
+        INSERT INTO bible_verses_fts(bible_verses_fts, rowid, book, content) 
         VALUES ('delete', old.id, old.book, old.content);
-        INSERT INTO bible_verses_fts(rowid, book, content_text) 
+        INSERT INTO bible_verses_fts(rowid, book, content) 
         VALUES (new.id, new.book, new.content);
       END;
     ''');
@@ -190,6 +200,8 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
         copyright: row.readNullable<String>('copyright'),
         createdAt: row.read<DateTime>('created_at'),
         updatedAt: row.read<DateTime>('updated_at'),
+        source: row.readNullable<String>('source') ?? 'local',
+        uuid: row.readNullable<String>('uuid') ?? const Uuid().v4(),
       );
     }).toList();
   }
@@ -202,9 +214,18 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
     return (select(songs)..where((t) => t.id.equals(id))).getSingleOrNull();
   }
 
-  /// Insert a new song
+  /// Insert a new song (Robust: uses insertOrReplace)
   Future<int> insertSong(SongsCompanion song) {
-    return into(songs).insert(song);
+    // Ensure default values are provided if missing (User Song Editor use case)
+    var finalSong = song;
+    if (!song.source.present) {
+      finalSong = finalSong.copyWith(source: const Value('local'));
+    }
+    if (!song.uuid.present) {
+      finalSong = finalSong.copyWith(uuid: Value(const Uuid().v4()));
+    }
+    // Using insertOrReplace to handle conflicts gracefully
+    return into(songs).insert(finalSong, mode: InsertMode.insertOrReplace);
   }
 
   /// Update an existing song
@@ -245,7 +266,7 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
       variables.add(Variable.withString(version));
     }
 
-    sql += ' ORDER BY rank LIMIT 100';
+    sql += ' ORDER BY rank LIMIT 50';
 
     final results = await customSelect(sql, variables: variables).get();
 
@@ -323,6 +344,14 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
     return count.read<int>('count') > 0;
   }
 
+  /// Get list of available versions
+  Future<List<String>> getAvailableVersions() async {
+    final results = await customSelect(
+      'SELECT DISTINCT version FROM bible_verses ORDER BY version'
+    ).get();
+    return results.map((row) => row.read<String>('version')).toList();
+  }
+
   /// Get total verse count for a version
   Future<int> getBibleVerseCount(String version) async {
     final count = await customSelect('''
@@ -340,14 +369,15 @@ class LiteWorshipDatabase extends _$LiteWorshipDatabase {
   Future<void> batchInsertBibleVerses(
       List<BibleVersesCompanion> verses) async {
     await batch((batch) {
-      batch.insertAll(bibleVerses, verses);
+      // Robust: Use insertOrReplace to prevent UNIQUE constraint crashes
+      batch.insertAll(bibleVerses, verses, mode: InsertMode.insertOrReplace);
     });
   }
 
   /// Batch insert songs
   Future<void> batchInsertSongs(List<SongsCompanion> songList) async {
     await batch((batch) {
-      batch.insertAll(songs, songList);
+      batch.insertAll(songs, songList, mode: InsertMode.insertOrReplace);
     });
   }
 

@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../config/theme.dart';
@@ -6,9 +7,9 @@ import '../providers/service_provider.dart';
 import '../providers/search_provider.dart';
 import '../data/database.dart' as db;
 import 'dashboard_search_field.dart';
-import '../providers/bible_provider.dart';
-import '../models/bible_model.dart';
 import 'bible_search_panel.dart';
+import '../models/search_result.dart';
+import '../screens/song_editor_screen.dart';
 
 class LibraryPanel extends ConsumerStatefulWidget {
   const LibraryPanel({super.key});
@@ -47,8 +48,6 @@ class _LibraryPanelState extends ConsumerState<LibraryPanel> with SingleTickerPr
     return const BibleSearchPanel();
   }
 
-
-
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -83,9 +82,21 @@ class _LibraryPanelState extends ConsumerState<LibraryPanel> with SingleTickerPr
   Widget _buildSongsTab() {
     return Column(
       children: [
-        const Padding(
-          padding: EdgeInsets.all(LWSpacing.sm),
-          child: DashboardSearchField(),
+        Padding(
+          padding: const EdgeInsets.all(LWSpacing.sm),
+          child: Row(
+            children: [
+              const Expanded(child: DashboardSearchField()),
+              const SizedBox(width: 8),
+              IconButton(
+                icon: const Icon(Icons.add),
+                tooltip: "Add New Song",
+                onPressed: () {
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => const SongEditorScreen()));
+                },
+              ),
+            ],
+          ),
         ),
         const Divider(height: 1),
         Expanded(
@@ -93,26 +104,54 @@ class _LibraryPanelState extends ConsumerState<LibraryPanel> with SingleTickerPr
             builder: (context, ref, child) {
               final resultsAsync = ref.watch(searchResultsProvider);
               return resultsAsync.when(
-                data: (List<db.Song> songs) {
-                   if (songs.isEmpty) {
-                     return const Center(child: Text("No songs found", style: TextStyle(color: LWColors.textMuted)));
+                data: (items) {
+                   if (items.isEmpty) {
+                     return const Center(child: Text("No results found", style: TextStyle(color: LWColors.textMuted)));
                    }
                    return ListView.separated(
-                    itemCount: songs.length,
+                    itemCount: items.length,
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (context, index) {
-                      final song = songs[index];
-                      return ListTile(
-                        title: Text(song.title, style: const TextStyle(color: LWColors.textPrimary)),
-                        subtitle: Text(song.author ?? '', style: const TextStyle(color: LWColors.textSecondary, fontSize: 12)),
-                        leading: const Icon(Icons.music_note, color: LWColors.primaryDim),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.add_circle_outline),
-                          onPressed: () => _addSong(song),
-                          tooltip: 'Add to Schedule',
-                        ),
-                        onTap: () => _addSong(song), // Also add on tap for speed? Or maybe preview?
-                      );
+                      final item = items[index];
+                      
+                      if (item is SongResult) {
+                        final song = item.song;
+                        return ListTile(
+                          title: Text(song.title, style: const TextStyle(color: LWColors.textPrimary)),
+                          subtitle: Text(song.author ?? 'Song', style: const TextStyle(color: LWColors.textSecondary, fontSize: 12)),
+                          leading: const Icon(Icons.music_note, color: LWColors.primaryDim),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.add_circle_outline),
+                            onPressed: () => _addSong(song),
+                            tooltip: 'Add to Schedule',
+                          ),
+                          onTap: () => _addSong(song),
+                        );
+                      } else if (item is BibleResult) {
+                        final verse = item.verse;
+                        return ListTile(
+                          title: Text("${verse.book} ${verse.chapter}:${verse.verse}", style: const TextStyle(color: LWColors.textPrimary)),
+                          subtitle: Text(verse.content, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: LWColors.textSecondary, fontSize: 12)),
+                          // Changed LWColors.secondary to LWColors.primary to fix compilation error if secondary is missing
+                          // Or use a safe color
+                          leading: const Icon(Icons.menu_book, color: LWColors.primary), 
+                          trailing: IconButton(
+                            icon: const Icon(Icons.add_circle_outline),
+                            onPressed: () {
+                              // We don't have a direct "Scripture Item" from Drift Verse handy in this scope without helpers.
+                              // For now, simple feedback
+                               ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Bible Verse selected (Support coming soon)'), duration: Duration(milliseconds: 500)),
+                              );
+                            },
+                            tooltip: 'Add to Schedule',
+                          ),
+                          onTap: () {
+                             // _addVerse(verse);
+                          },
+                        );
+                      }
+                      return const SizedBox.shrink();
                     },
                   );
                 },

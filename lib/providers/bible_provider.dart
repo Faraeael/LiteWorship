@@ -1,254 +1,283 @@
-import 'dart:convert';
-import 'package:flutter/services.dart';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../models/bible_model.dart';
+import '../data/database.dart'; // Drift models: BibleVerse
+import '../repositories/bible_repository.dart';
+import '../services/bible_download_service.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../data/database.dart'; // Drift models: BibleVerse
+import '../repositories/bible_repository.dart';
+import '../services/bible_download_service.dart';
+import 'search_provider.dart'; // for databaseProvider
 
-// State for the Bible Data
-// Bible Versions Enum
-enum BibleVersion {
-  kjv('King James Version', 'kjv_bible.json'),
-  niv('New International Version', 'kjv_bible.json'), // Using KJV as placeholder
-  tag('Tagalog Biblia', 'kjv_bible.json'); // Using KJV as placeholder
-
-  final String displayName;
-  final String assetName;
-  const BibleVersion(this.displayName, this.assetName);
+enum BibleSearchMode {
+  reference,
+  keyword,
 }
 
-// Current Selected Version
-final selectedBibleVersionProvider = StateProvider<BibleVersion>((ref) => BibleVersion.kjv);
+// ============================================================================
+// LITEWORSHIP — Bible State & Logic
+// Handles dynamic version switching, navigation, and smart search
+// ============================================================================
 
-// State for the Bible Data (Reloads when version changes)
-final bibleDataProvider = FutureProvider<List<BibleBook>>((ref) async {
-  final version = ref.watch(selectedBibleVersionProvider);
-  // In real app, we would load different files based on version.assetName
-  final jsonString = await rootBundle.loadString('assets/data/${version.assetName}');
-  final jsonMap = jsonDecode(jsonString);
-  final booksList = jsonMap['books'] as List;
-  return booksList.map((b) => BibleBook.fromJson(b)).toList();
+final bibleRepositoryProvider = Provider<BibleRepository>((ref) {
+  return BibleRepository(ref.watch(databaseProvider));
 });
 
-// Navigation State (Miller Columns)
-final selectedBookIndexProvider = StateProvider<int>((ref) => -1);
-final selectedChapterIndexProvider = StateProvider<int>((ref) => -1);
+final bibleDownloadServiceProvider = Provider<BibleDownloadService>((ref) {
+  return BibleDownloadService();
+});
 
-// State for Search Results
-class BibleSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
-  BibleSearchNotifier() : super([]);
+// ----------------------------------------------------------------------------
+// VERSION MANAGEMENT
+// ----------------------------------------------------------------------------
 
-  void search(String query, List<BibleBook> bible) {
+/// List of available Bible versions in the database
+final availableBibleVersionsProvider = FutureProvider<List<String>>((ref) async {
+  final repo = ref.watch(bibleRepositoryProvider);
+  return repo.getAvailableVersions();
+});
+
+/// Currently selected Bible version (default: KJV)
+final selectedBibleVersionProvider = StateProvider<String>((ref) => 'KJV');
+
+/// List of books for the selected version (for navigation)
+final bibleBooksProvider = FutureProvider<List<String>>((ref) async {
+  final repo = ref.watch(bibleRepositoryProvider);
+  final version = ref.watch(selectedBibleVersionProvider);
+  return repo.getBooks(version: version);
+});
+
+// ----------------------------------------------------------------------------
+// NAVIGATION STATE (Miller Columns)
+// ----------------------------------------------------------------------------
+
+final selectedBookProvider = StateProvider<String?>((ref) => null);
+final selectedChapterProvider = StateProvider<int?>((ref) => null);
+
+/// Chapters for selected book
+final bibleChaptersProvider = FutureProvider<List<int>>((ref) async {
+  final repo = ref.watch(bibleRepositoryProvider);
+  final version = ref.watch(selectedBibleVersionProvider);
+  final book = ref.watch(selectedBookProvider);
+  
+  if (book == null) return [];
+  return repo.getChapters(version: version, book: book);
+});
+
+/// Verses for selected chapter
+final bibleVersesProvider = FutureProvider<List<BibleVerse>>((ref) async {
+  final repo = ref.watch(bibleRepositoryProvider);
+  final version = ref.watch(selectedBibleVersionProvider);
+  final book = ref.watch(selectedBookProvider);
+  final chapter = ref.watch(selectedChapterProvider);
+  
+  if (book == null || chapter == null) return [];
+  
+  // Ensure we return List<BibleVerse> (Drift model)
+  return repo.getByReference(
+    version: version, 
+    book: book, 
+    chapter: chapter
+  );
+});
+
+// ----------------------------------------------------------------------------
+// SEARCH LOGIC
+// ----------------------------------------------------------------------------
+
+/// Stores the current search query to enable re-searching on version change
+final bibleSearchQueryProvider = StateProvider<String>((ref) => '');
+
+/// Stores the current search mode (Reference vs Keyword)
+final bibleSearchModeProvider = StateProvider<BibleSearchMode>((ref) => BibleSearchMode.reference);
+
+/// Stores the ID of the verse to highlight (for Reference Mode auto-scroll)
+final bibleSearchHighlightProvider = StateProvider<int?>((ref) => null);
+
+class BibleSearchNotifier extends StateNotifier<List<BibleVerse>> {
+  final Ref ref;
+  
+  BibleSearchNotifier(this.ref) : super([]) {
+    // Watch for version changes and re-run search if query exists
+    ref.listen(selectedBibleVersionProvider, (previous, next) {
+      if (previous != next) {
+        final query = ref.read(bibleSearchQueryProvider);
+        if (query.isNotEmpty) {
+          search(query);
+        }
+      }
+    });
+  }
+
+  Future<void> search(String query) async {
     if (query.trim().isEmpty) {
       state = [];
       return;
     }
 
-    // 1. SMART PARSE
-    // Regex: (Number optional) (Letters) (Space optional) (Number optional) (Colon optional) (Number optional)
-    // Matches: "1 Cor", "1Cor", "Gen 1", "Jn 3:16"
-    final refRegex = RegExp(r'^(\d?)\s*([a-zA-Z]+)(?:\s+(\d+))?(?:[:\s](\d+))?$');
-    final match = refRegex.firstMatch(query.trim());
+    // Capture the query for "EasyWorship" style state-based re-search
+    ref.read(bibleSearchQueryProvider.notifier).state = query;
 
-    if (match != null) {
-      final numPrefix = match.group(1) ?? '';
-      final namePart = match.group(2) ?? '';
-      final chapterStr = match.group(3);
-      final verseStr = match.group(4);
+    final repo = ref.read(bibleRepositoryProvider);
+    final version = ref.read(selectedBibleVersionProvider);
+    final mode = ref.read(bibleSearchModeProvider);
 
-      // Reconstruct Book Name (e.g., "1Cor" -> "1 Cor" if needed by helper, but helper handles it)
-      final bookQuery = numPrefix.isNotEmpty ? "$numPrefix$namePart" : namePart;
-      
-      final bookIndex = _findBookIndex(bible, bookQuery);
-      if (bookIndex != -1) {
-        final book = bible[bookIndex];
-        
+    if (mode == BibleSearchMode.reference) {
+      // 1. ROBUST REFERENCE PARSE
+      // Handles: "1Cor 13:4", "1 Cor 13:4", "Jn 3:16", "John 3 16"
+      final refRegex = RegExp(r'^(\d?\s*[a-zA-Z]+)\s+(\d+)(?:[:\s](\d+)(?:-(\d+))?)?$');
+      final match = refRegex.firstMatch(query.trim());
+
+      if (match != null) {
+        final bookPart = match.group(1)?.trim() ?? '';
+        final chapterStr = match.group(2);
+        final verseStr = match.group(3);
+        final verseEndStr = match.group(4);
+
         if (chapterStr != null) {
-           final chapterNum = int.tryParse(chapterStr);
-           if (chapterNum != null && chapterNum > 0 && chapterNum <= book.chapters.length) {
-              final chapter = book.chapters[chapterNum - 1];
-              
-              if (verseStr != null) {
-                // Verse specified: "Jn 3 16"
-                final verseNum = int.tryParse(verseStr);
-                 if (verseNum != null && verseNum > 0 && verseNum <= chapter.verses.length) {
-                    // Exact Verse Match
-                    state = [{
-                      'book': book,
-                      'chapter': chapter,
-                      'verse': chapter.verses[verseNum - 1]
-                    }];
-                    return;
-                 }
-              } else {
-                // Whole Chapter match
-                state = chapter.verses.take(100).map((v) => { // Increased limit
-                  'book': book,
-                  'chapter': chapter,
-                  'verse': v
-                }).toList();
-                return;
-              }
-           }
-        } else {
-           // BOOK ONLY MATCH (e.g. "1Cor") -> Return Ch 1 (or all? Limiting to avoid lag)
-           // Let's return Chapter 1 verses by default for responsiveness
-           if (book.chapters.isNotEmpty) {
-             state = book.chapters[0].verses.map((v) => {
-               'book': book,
-               'chapter': book.chapters[0],
-               'verse': v
-             }).toList();
-             return;
-           }
-        }
-      }
-    }
-
-    // 2. FALLBACK: Keyword Search
-    final lowerQ = query.toLowerCase();
-    final List<Map<String, dynamic>> results = [];
-    int count = 0;
-
-    for (var book in bible) {
-      for (var chapter in book.chapters) {
-        for (var verse in chapter.verses) {
-            bool match = verse.text.toLowerCase().contains(lowerQ);
-            if (match) {
-               results.add({
-                 'book': book,
-                 'chapter': chapter,
-                 'verse': verse
-               });
-               count++;
-               if (count >= 50) break;
+          final bookList = await repo.getBooks(version: version);
+          final bookName = _findBookName(bookList, bookPart);
+          if (bookName != null) {
+            final chapter = int.tryParse(chapterStr) ?? 1;
+            final verseStart = verseStr != null ? int.tryParse(verseStr) : null;
+            
+            // Set highlight if a specific verse was requested
+            if (verseStart != null) {
+              ref.read(bibleSearchHighlightProvider.notifier).state = verseStart;
+            } else {
+              ref.read(bibleSearchHighlightProvider.notifier).state = null;
             }
+
+            final results = await repo.getByReference(
+              version: version,
+              book: bookName,
+              chapter: chapter,
+              // Repo now ignores verseStart/End to return full chapter
+              verseStart: verseStart,
+            );
+            
+            state = results;
+            return;
+          }
         }
-        if (count >= 50) break;
       }
-      if (count >= 50) break;
+      // If reference parsing fails, return empty or maybe a "Not Found" state
+      // For now, we just clear results if it's not a valid reference
+      state = [];
+    } else {
+      // 2. KEYWORD SEARCH
+      final textResults = await repo.searchByKeyword(query, version: version);
+      state = textResults;
     }
-    state = results;
   }
-
-  int _findBookIndex(List<BibleBook> bible, String query) {
-    var q = query.toLowerCase().replaceAll(RegExp(r'\.'), '').trim();
+  
+  /// Helper to fuzzy match book names from query parts
+  String? _findBookName(List<String> books, String queryBook) {
+    // Normalize: Remove spaces if it starts with digit (e.g., "1 Cor" -> "1Cor") for caching/lookup consistency
+    // Actually, simpler to just normalize the input query to lower case and handle variations
     
-    // Extract number prefix if present (e.g., "1cor" -> prefix="1", rest="cor")
-    String numPrefix = '';
-    String bookPart = q;
+    String q = queryBook.toLowerCase().replaceAll(RegExp(r'\s+'), ''); // remove all spaces for matching
     
-    final numMatch = RegExp(r'^(\d+)\s*(.+)$').firstMatch(q);
-    if (numMatch != null) {
-      numPrefix = numMatch.group(1)!;
-      bookPart = numMatch.group(2)!.trim();
-    }
-
-    // 1. Exact Name Match
-    int idx = bible.indexWhere((b) => b.name.toLowerCase() == q);
-    if (idx != -1) return idx;
-    
-    // 2. Starts With (handles "genesis" from "gen")
-    idx = bible.indexWhere((b) => b.name.toLowerCase().startsWith(q));
-    if (idx != -1) return idx;
-
-    // 3. Common Abbreviations (Extended)
+    // Map common abbreviations to full names (normalized keys)
     final abbrevs = {
-      'gen': 'genesis', 'ex': 'exodus', 'lev': 'leviticus', 'num': 'numbers', 'deut': 'deuteronomy', 'dt': 'deuteronomy',
-      'josh': 'joshua', 'jos': 'joshua', 'judg': 'judges', 'jdg': 'judges', 'ruth': 'ruth', 'rut': 'ruth',
-      'sam': 'samuel', 'sa': 'samuel', 
-      'king': 'kings', 'kgs': 'kings', 'kg': 'kings', 'ki': 'kings',
-      'chr': 'chronicles', 'ch': 'chronicles', 'chron': 'chronicles',
-      'ezr': 'ezra', 'neh': 'nehemiah', 'ne': 'nehemiah', 'est': 'esther', 'es': 'esther',
-      'jb': 'job', 'ps': 'psalms', 'psa': 'psalms', 'psalm': 'psalms',
-      'prov': 'proverbs', 'pr': 'proverbs', 'ecc': 'ecclesiastes', 'ec': 'ecclesiastes',
-      'song': 'song of solomon', 'so': 'song of solomon', 'sos': 'song of solomon',
-      'isa': 'isaiah', 'is': 'isaiah', 'jer': 'jeremiah', 'jr': 'jeremiah',
-      'lam': 'lamentations', 'la': 'lamentations', 'ezek': 'ezekiel', 'ez': 'ezekiel', 'eze': 'ezekiel',
-      'dan': 'daniel', 'da': 'daniel', 'hos': 'hosea', 'ho': 'hosea',
-      'joel': 'joel', 'jl': 'joel', 'amos': 'amos', 'am': 'amos',
-      'obad': 'obadiah', 'ob': 'obadiah', 'jonah': 'jonah', 'jon': 'jonah',
-      'mic': 'micah', 'mi': 'micah', 'nah': 'nahum', 'na': 'nahum',
-      'hab': 'habakkuk', 'ha': 'habakkuk', 'zeph': 'zephaniah', 'ze': 'zephaniah',
-      'hag': 'haggai', 'hg': 'haggai', 'zech': 'zechariah', 'zc': 'zechariah', 'zec': 'zechariah',
-      'mal': 'malachi', 'ma': 'malachi',
-      'matt': 'matthew', 'mt': 'matthew', 'mat': 'matthew',
-      'mark': 'mark', 'mk': 'mark', 'mr': 'mark',
-      'luke': 'luke', 'lk': 'luke', 'lu': 'luke',
-      'john': 'john', 'jn': 'john', 'joh': 'john',
-      'acts': 'acts', 'ac': 'acts', 'act': 'acts',
-      'rom': 'romans', 'rm': 'romans', 'ro': 'romans',
-      'cor': 'corinthians', 'co': 'corinthians',
-      'gal': 'galatians', 'ga': 'galatians',
-      'eph': 'ephesians', 'ep': 'ephesians',
-      'phil': 'philippians', 'php': 'philippians', 'ph': 'philippians',
-      'col': 'colossians', 'cl': 'colossians',
-      'thess': 'thessalonians', 'th': 'thessalonians', 'thes': 'thessalonians',
-      'tim': 'timothy', 'ti': 'timothy',
-      'titus': 'titus', 'tit': 'titus', 'tt': 'titus',
-      'philem': 'philemon', 'phm': 'philemon', 'phlm': 'philemon',
-      'heb': 'hebrews', 'he': 'hebrews',
-      'james': 'james', 'jas': 'james', 'ja': 'james', 'jm': 'james',
-      'pet': 'peter', 'pe': 'peter', 'pt': 'peter',
-      'jude': 'jude', 'jud': 'jude', 'ju': 'jude',
-      'rev': 'revelation', 're': 'revelation', 'reve': 'revelation', 'revelations': 'revelation'
+      'genesis': 'Genesis', 'gen': 'Genesis', 'ge': 'Genesis', 'gn': 'Genesis',
+      'exodus': 'Exodus', 'ex': 'Exodus', 'exod': 'Exodus',
+      'leviticus': 'Leviticus', 'lev': 'Leviticus', 'lv': 'Leviticus',
+      'numbers': 'Numbers', 'num': 'Numbers', 'nm': 'Numbers',
+      'deuteronomy': 'Deuteronomy', 'deut': 'Deuteronomy', 'dt': 'Deuteronomy',
+      'joshua': 'Joshua', 'josh': 'Joshua', 'jos': 'Joshua',
+      'judges': 'Judges', 'judg': 'Judges', 'jdg': 'Judges',
+      'ruth': 'Ruth', 'ru': 'Ruth',
+      '1samuel': '1 Samuel', '1sam': '1 Samuel', '1sa': '1 Samuel', '1s': '1 Samuel',
+      '2samuel': '2 Samuel', '2sam': '2 Samuel', '2sa': '2 Samuel', '2s': '2 Samuel',
+      '1kings': '1 Kings', '1kgs': '1 Kings', '1ki': '1 Kings', '1k': '1 Kings',
+      '2kings': '2 Kings', '2kgs': '2 Kings', '2ki': '2 Kings', '2k': '2 Kings',
+      '1chronicles': '1 Chronicles', '1chr': '1 Chronicles', '1ch': '1 Chronicles',
+      '2chronicles': '2 Chronicles', '2chr': '2 Chronicles', '2ch': '2 Chronicles',
+      'ezra': 'Ezra', 'ezr': 'Ezra',
+      'nehemiah': 'Nehemiah', 'neh': 'Nehemiah', 'ne': 'Nehemiah',
+      'esther': 'Esther', 'est': 'Esther',
+      'job': 'Job', 'jb': 'Job',
+      'psalms': 'Psalms', 'psalm': 'Psalms', 'ps': 'Psalms', 'psa': 'Psalms',
+      'proverbs': 'Proverbs', 'prov': 'Proverbs', 'pro': 'Proverbs', 'prv': 'Proverbs',
+      'ecclesiastes': 'Ecclesiastes', 'ecc': 'Ecclesiastes', 'ec': 'Ecclesiastes',
+      'songofsolomon': 'Song of Solomon', 'song': 'Song of Solomon', 'sos': 'Song of Solomon', 'canticles': 'Song of Solomon',
+      'isaiah': 'Isaiah', 'isa': 'Isaiah',
+      'jeremiah': 'Jeremiah', 'jer': 'Jeremiah',
+      'lamentations': 'Lamentations', 'lam': 'Lamentations', 'lm': 'Lamentations',
+      'ezekiel': 'Ezekiel', 'ezek': 'Ezekiel', 'ez': 'Ezekiel',
+      'daniel': 'Daniel', 'dan': 'Daniel', 'dn': 'Daniel',
+      'hosea': 'Hosea', 'hos': 'Hosea', 'ho': 'Hosea',
+      'joel': 'Joel', 'jl': 'Joel',
+      'amos': 'Amos', 'am': 'Amos',
+      'obadiah': 'Obadiah', 'obad': 'Obadiah', 'ob': 'Obadiah',
+      'jonah': 'Jonah', 'jon': 'Jonah', 'jnh': 'Jonah',
+      'micah': 'Micah', 'mic': 'Micah', 'mc': 'Micah',
+      'nahum': 'Nahum', 'nah': 'Nahum', 'na': 'Nahum',
+      'habakkuk': 'Habakkuk', 'hab': 'Habakkuk',
+      'zephaniah': 'Zephaniah', 'zeph': 'Zephaniah', 'zep': 'Zephaniah',
+      'haggai': 'Haggai', 'hag': 'Haggai', 'hg': 'Haggai',
+      'zechariah': 'Zechariah', 'zech': 'Zechariah', 'zec': 'Zechariah',
+      'malachi': 'Malachi', 'mal': 'Malachi',
+      'matthew': 'Matthew', 'matt': 'Matthew', 'mt': 'Matthew',
+      'mark': 'Mark', 'mk': 'Mark', 'mrk': 'Mark',
+      'luke': 'Luke', 'lk': 'Luke', 'luc': 'Luke',
+      'john': 'John', 'jn': 'John', 'jhn': 'John',
+      'acts': 'Acts', 'ac': 'Acts',
+      'romans': 'Romans', 'rom': 'Romans', 'rm': 'Romans',
+      '1corinthians': '1 Corinthians', '1cor': '1 Corinthians', '1co': '1 Corinthians',
+      '2corinthians': '2 Corinthians', '2cor': '2 Corinthians', '2co': '2 Corinthians',
+      'galatians': 'Galatians', 'gal': 'Galatians', 'gl': 'Galatians',
+      'ephesians': 'Ephesians', 'eph': 'Ephesians',
+      'philippians': 'Philippians', 'phil': 'Philippians', 'php': 'Philippians',
+      'colossians': 'Colossians', 'col': 'Colossians',
+      '1thessalonians': '1 Thessalonians', '1thess': '1 Thessalonians', '1th': '1 Thessalonians',
+      '2thessalonians': '2 Thessalonians', '2thess': '2 Thessalonians', '2th': '2 Thessalonians',
+      '1timothy': '1 Timothy', '1tim': '1 Timothy', '1ti': '1 Timothy',
+      '2timothy': '2 Timothy', '2tim': '2 Timothy', '2ti': '2 Timothy',
+      'titus': 'Titus', 'tit': 'Titus',
+      'philemon': 'Philemon', 'philem': 'Philemon', 'phm': 'Philemon',
+      'hebrews': 'Hebrews', 'heb': 'Hebrews',
+      'james': 'James', 'jas': 'James', 'jm': 'James',
+      '1peter': '1 Peter', '1pet': '1 Peter', '1pe': '1 Peter', '1pt': '1 Peter',
+      '2peter': '2 Peter', '2pet': '2 Peter', '2pe': '2 Peter', '2pt': '2 Peter',
+      '1john': '1 John', '1jn': '1 John', '1jhn': '1 John',
+      '2john': '2 John', '2jn': '2 John', '2jhn': '2 John',
+      '3john': '3 John', '3jn': '3 John', '3jhn': '3 John',
+      'jude': 'Jude', 'jud': 'Jude', 'jd': 'Jude',
+      'revelation': 'Revelation', 'rev': 'Revelation', 'rv': 'Revelation',
     };
     
-    // Try to expand the book part using abbreviations
-    String expandedBook = abbrevs[bookPart] ?? bookPart;
+    // 1. Try exact match in map
+    if (abbrevs.containsKey(q)) {
+      return abbrevs[q];
+    }
     
-    // Build search term with number prefix if present
-    String searchTerm = numPrefix.isNotEmpty ? '$numPrefix $expandedBook' : expandedBook;
-    
-    // Map Arabic to Roman for names like "I Kings", "II Corinthians"
-    String romanPrefix = '';
-    if (numPrefix == '1') romanPrefix = 'i';
-    else if (numPrefix == '2') romanPrefix = 'ii';
-    else if (numPrefix == '3') romanPrefix = 'iii';
-    
-    // Try exact match first
-    idx = bible.indexWhere((b) => b.name.toLowerCase() == searchTerm);
-    if (idx != -1) return idx;
-    
-    // Try contains match with Roman Numeral support
-    // e.g. "1cor" -> prefix:1, book:cor -> expanded:corinthians
-    // Matches "I Corinthians" because it starts with "i " and contains "corinthians"
-    idx = bible.indexWhere((b) {
-      final bookName = b.name.toLowerCase();
-      
-      if (numPrefix.isNotEmpty) {
-        bool matchesArabic = bookName.startsWith(numPrefix) && bookName.contains(expandedBook);
-        bool matchesRoman = false;
-        if (romanPrefix.isNotEmpty) {
-           // Check for "i " or "i" (e.g. "i kings" or "1kings" -> "1 kings")
-           // Roman numerals in this JSON seem to be "I Kings" (space after I)
-           matchesRoman = bookName.startsWith("$romanPrefix ") && bookName.contains(expandedBook);
-        }
-        return matchesArabic || matchesRoman;
-      } else {
-        // If no number typed, but book has number (e.g. user typed "corinthians", match "I Corinthians"?)
-        // Usually if user types "corinthians", they want 1 Cor 1:1 or list of books?
-        // Let's stick to contains for lazy search.
-        return bookName.contains(expandedBook);
-      }
-    });
-    if (idx != -1) return idx;
+    // 2. Try matching against actual book list (removing spaces for comparison)
+    try {
+      return books.firstWhere((b) => b.toLowerCase().replaceAll(' ', '') == q);
+    } catch (_) {}
 
-    // Try starts-with on the book part only (for partial matches)
-    // Also try comparing roman prefix + bookPart raw
-    idx = bible.indexWhere((b) {
-      final bookName = b.name.toLowerCase();
-      if (numPrefix.isNotEmpty) {
-        bool matchesArabic = bookName.startsWith(numPrefix) && bookName.contains(bookPart);
-        bool matchesRoman = romanPrefix.isNotEmpty && bookName.startsWith("$romanPrefix ") && bookName.contains(bookPart);
-        return matchesArabic || matchesRoman;
-      } else {
-        return bookName.startsWith(bookPart);
-      }
-    });
-    
-    return idx;
+    try {
+      return books.firstWhere((b) => b.toLowerCase().replaceAll(' ', '').startsWith(q));
+    } catch (_) {}
+
+    return null;
   }
 }
 
-final bibleSearchProvider = StateNotifierProvider<BibleSearchNotifier, List<Map<String, dynamic>>>((ref) {
-  return BibleSearchNotifier();
+final bibleSearchProvider = StateNotifierProvider<BibleSearchNotifier, List<BibleVerse>>((ref) {
+  return BibleSearchNotifier(ref);
+});
+
+// Watcher to trigger re-search when version changes
+final bibleSearchWatcher = Provider((ref) {
+  ref.listen(selectedBibleVersionProvider, (previous, next) {
+    if (previous != next) {
+      final query = ref.read(bibleSearchQueryProvider);
+      if (query.isNotEmpty) {
+        ref.read(bibleSearchProvider.notifier).search(query);
+      }
+    }
+  });
 });

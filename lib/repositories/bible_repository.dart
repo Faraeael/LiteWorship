@@ -1,3 +1,5 @@
+
+import 'package:drift/drift.dart';
 import '../data/database.dart';
 
 // ============================================================================
@@ -18,29 +20,11 @@ class BibleRepository {
   /// Search Bible verses by content
   /// 
   /// Uses FTS5 for instant fuzzy matching across 31,000+ verses.
-  /// 
-  /// Example:
-  /// ```dart
-  /// final verses = await repo.search('for God so loved');
-  /// // Returns John 3:16 and related verses
-  /// ```
-  Future<List<BibleVerse>> search(String query, {String? version}) async {
+  Future<List<BibleVerse>> searchByKeyword(String query, {String? version}) async {
     return _db.searchBibleVerses(query, version: version);
   }
 
   /// Get verses by reference
-  /// 
-  /// Examples:
-  /// ```dart
-  /// // Single verse
-  /// await repo.getByReference(version: 'KJV', book: 'John', chapter: 3, verseStart: 16);
-  /// 
-  /// // Verse range
-  /// await repo.getByReference(version: 'KJV', book: 'John', chapter: 3, verseStart: 16, verseEnd: 17);
-  /// 
-  /// // Entire chapter
-  /// await repo.getByReference(version: 'KJV', book: 'John', chapter: 3);
-  /// ```
   Future<List<BibleVerse>> getByReference({
     required String version,
     required String book,
@@ -48,18 +32,22 @@ class BibleRepository {
     int? verseStart,
     int? verseEnd,
   }) {
+    // EasyWorship Behavior: Always fetch the FULL chapter, even if a specific verse is requested.
+    // The Provider/UI will handle highlighting the specific verse.
     return _db.getVersesByReference(
       version: version,
       book: book,
       chapter: chapter,
-      verseStart: verseStart,
-      verseEnd: verseEnd,
+      // Intentionally ignoring verseStart/verseEnd here to get whole chapter
     );
   }
 
+  /// Get available bible versions
+  Future<List<String>> getAvailableVersions() {
+    return _db.getAvailableVersions();
+  }
+
   /// Get all books for a Bible version
-  /// 
-  /// Returns books in canonical order (Genesis to Revelation)
   Future<List<String>> getBooks({required String version}) {
     return _db.getBooksForVersion(version);
   }
@@ -82,9 +70,37 @@ class BibleRepository {
     return _db.getBibleVerseCount(version);
   }
 
+  // ==========================================================================
+  // INGESTION METHODS
+  // ==========================================================================
+  
+  /// Batch insert bible verses (Used by Ingestion Service)
+  Future<void> batchInsertBibleVerses(List<BibleVersesCompanion> verses) async {
+    // Using insertOrReplace to safely handle duplicates during ingestion retry
+    await _db.batch((batch) {
+      batch.insertAll(_db.bibleVerses, verses, mode: InsertMode.insertOrReplace);
+    });
+  }
+
+  /// Rebuild FTS indexes manually (Used by Ingestion Service)
+  Future<void> rebuildFtsIndexes() async {
+    try {
+      await _db.rebuildFtsIndexes();
+    } catch (e) {
+      print("FTS Error ignored: $e");
+    }
+  }
+
+  /// Delete a specific version
+  Future<void> deleteVersion(String version) async {
+     await _db.customStatement('DELETE FROM bible_verses WHERE version = ?', [version]);
+  }
+
+  // ==========================================================================
+  // HELPERS
+  // ==========================================================================
+
   /// Format a verse reference as a string
-  /// 
-  /// Example: "John 3:16" or "John 3:16-17"
   static String formatReference(BibleVerse verse, {BibleVerse? endVerse}) {
     if (endVerse != null && endVerse.verse != verse.verse) {
       return '${verse.book} ${verse.chapter}:${verse.verse}-${endVerse.verse}';

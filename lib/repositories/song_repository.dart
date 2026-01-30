@@ -47,6 +47,11 @@ class SongRepository {
     return _db.getSongById(id);
   }
 
+  /// Get a single song by UUID
+  Future<Song?> getByUuid(String uuid) async {
+    return (_db.select(_db.songs)..where((t) => t.uuid.equals(uuid))).getSingleOrNull();
+  }
+
   /// Create a new song
   /// 
   /// Returns the auto-generated ID of the new song.
@@ -65,6 +70,8 @@ class SongRepository {
       author: author != null ? Value(author) : const Value.absent(),
       ccliNumber: ccliNumber != null ? Value(ccliNumber) : const Value.absent(),
       copyright: copyright != null ? Value(copyright) : const Value.absent(),
+      source: const Value('local'), // Default for manual creation via repo, or 'bundled'
+      uuid: Value(DateTime.now().millisecondsSinceEpoch.toString()), // Simple fallback
     ));
   }
 
@@ -76,6 +83,19 @@ class SongRepository {
   /// Delete a song by ID
   Future<int> delete(int id) {
     return _db.deleteSong(id);
+  }
+
+  /// Upsert a user song (Insert or Update based on UUID)
+  Future<void> syncUserSong(String uuid, SongsCompanion song) async {
+    // Check if exists by UUID
+    final existing = await getByUuid(uuid);
+    if (existing != null) {
+      // Update
+      await (_db.update(_db.songs)..where((t) => t.uuid.equals(uuid))).write(song);
+    } else {
+      // Insert
+      await _db.into(_db.songs).insert(song);
+    }
   }
 
   /// Search songs and return as a stream (for real-time UI updates)

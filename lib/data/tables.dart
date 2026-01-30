@@ -34,6 +34,12 @@ class Songs extends Table {
 
   /// Last modified timestamp
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  /// Data source: 'local' (user-added) or 'bundled' (built-in)
+  TextColumn get source => text().withDefault(const Constant('bundled'))();
+
+  /// Unique ID for synchronization (UUID)
+  TextColumn get uuid => text().nullable()();
 }
 
 /// Bible verses table for scripture display
